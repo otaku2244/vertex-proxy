@@ -1,0 +1,24 @@
+[Unit]
+Description=Vertex AI OpenAI-compatible proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=PORT=18230
+Environment=GCP_PROJECT=your-gcp-project-id
+Environment=GCP_LOCATION=global
+Environment=PROXY_TOKEN=change-me-to-a-long-random-string
+Environment=RETRY_MAX=3
+Environment=RETRY_BASE_MS=800
+Environment=RETRY_CAP_MS=8000
+ExecStart=/usr/local/bin/node /opt/vertex-proxy/server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# credentials & runtime artifacts
+application_default_credentials.json
+*.bak
+*.log
+*.json
+!package.json
+
+# os
+.DS_Store
+Thumbs.db
