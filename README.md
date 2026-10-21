@@ -140,16 +140,46 @@ curl -s http://127.0.0.1:18230/v1/chat/completions \
 
 ## 模型与区域
 
-| 模型 ID | 可用区域 | 备注 |
-|---|---|---|
-| `google/gemini-4-argon` | **仅 `global`** | 2026-10 GA，前沿模型，单价较高 |
-| `google/gemini-2.5-pro` | `global` / `us-central1` | 上一代旗舰 |
-| `google/gemini-2.5-flash` | `global` / `us-central1` | 日常主力，性价比高 |
-| `google/gemini-2.5-flash-lite` | `global` | 最便宜，适合高频轻任务 |
+| 模型 ID | 类型 | 实测首字节 | 备注 |
+|---|---|---|---|
+| `google/gemini-4-argon` | 旗舰 | 挂起中 | **仅 `global`**，近期大面积无响应 |
+| `google/gemini-3.8-flash` | flash | 429 | 最新 flash，配额较紧 |
+| `google/gemini-3.7-flash` | flash | 0.81s | 快且稳 |
+| `google/gemini-3.6-flash` | flash | 0.89s | 输出最详细 |
+| `google/gemini-3.5-flash` | flash | 0.87s | 均衡 |
+| `google/gemini-3.5-flash-lite` | lite | 0.73s | 最便宜最快 |
+| `google/gemini-3.1-pro-preview` | pro | 1.96s | **只有 preview 版**，限流严格 |
+| `google/gemini-3.1-flash-lite` | lite | 0.82s | 3.1 唯一转正的 |
+| `google/gemini-3-flash-preview` | flash | 1.16s | preview |
+| `google/gemini-2.5-pro` | pro | 4.72s | GA 正式版，长期可用 |
+| `google/gemini-2.5-flash` | flash | 3.79s | GA 正式版 |
+| `google/gemini-2.5-flash-lite` | lite | 3.80s | GA 正式版 |
+
+**3.x flash 比 2.5-flash 快 1.6–2.8 倍**，同 prompt 下输出还更详细。日常建议直接用 3.6/3.5-flash，不必守着 2.5。
 
 **区域是最大的坑：** `gemini-4-argon` 只在 `global` 可用，请求打到 `us-central1` 会返回 404，报错内容是「Publisher model ... was not found or your project does not have access to it」，看起来像没权限，实际是区域不对。
 
 另外 `global` 的域名规则和区域性端点不同：`global` 走 `aiplatform.googleapis.com`，**不带** `global-` 前缀。代码里已做分支处理。
+
+### 为什么 2.5-pro 还在、3.1 却「没有」
+
+不是没有，是名字不一样。3.1 的 pro 只有 **preview** 版（`gemini-3.1-pro-preview`），写成 `gemini-3.1-pro` 才会 404。
+
+2.5-pro 能长期存在是因为它是 **GA（正式版）**，Vertex 对 GA 模型承诺稳定可用；3.1-pro 至今没转正，只有 preview，会到期下架。两代并存是正常的生命周期差异，不是「新模型被撤了」。
+
+### 查完整模型清单
+
+```bash
+GET https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=200
+```
+
+三个必须注意的点：
+
+1. 必须带 header `x-goog-user-project: <你的项目ID>`，否则 403（ADC 缺 quota project 声明）
+2. 只有 **`v1beta1`** 有这个端点，`v1` 返回 404
+3. 返回字段叫 **`publisherModels`**，不是 `models`——用错字段会静默得到 0 条，看着像「没有模型」
+
+清单里还有 `-tts`、`-image`、`-transcribe`、`-embedding`、`live` 等变体，它们不能用于 Chat Completions，别手填进客户端。
 
 ---
 

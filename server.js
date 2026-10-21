@@ -26,6 +26,14 @@ const TTFB_NONSTREAM_MS = Number(process.env.TTFB_NONSTREAM_MS || 120000);
 
 const MODELS = [
   'google/gemini-4-argon',
+  'google/gemini-3.8-flash',
+  'google/gemini-3.7-flash',
+  'google/gemini-3.6-flash',
+  'google/gemini-3.5-flash',
+  'google/gemini-3.5-flash-lite',
+  'google/gemini-3.1-pro-preview',
+  'google/gemini-3.1-flash-lite',
+  'google/gemini-3-flash-preview',
   'google/gemini-2.5-pro',
   'google/gemini-2.5-flash',
   'google/gemini-2.5-flash-lite'
