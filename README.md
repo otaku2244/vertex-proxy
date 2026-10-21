@@ -111,6 +111,7 @@ python3 scripts/deploy.py
 | `RETRY_MAX` | 否 | `3` | 429/503 的额外重试次数（总尝试 = 该值 + 1） |
 | `RETRY_BASE_MS` | 否 | `800` | 指数退避基数，第 n 次等待约 `base × 2^(n-1)` |
 | `RETRY_CAP_MS` | 否 | `8000` | 单次退避上限；上游返回 `Retry-After` 时优先服从它 |
+| `RETRY_BUDGET_MS` | 否 | `25000` | 重试总预算，从请求开始计时；超出即停止重试、直接返回 429/503 |
 | `TTFB_STREAM_MS` | 否 | `45000` | 流式请求的首字节超时（首字节 = 首个 token） |
 | `TTFB_NONSTREAM_MS` | 否 | `120000` | 非流式请求的首字节超时（首字节 = 全文生成完，必须给足） |
 | `UPSTREAM_OVERRIDE` | 否 | 空 | 仅自测用，把上游指向本地 mock，生产留空 |
@@ -394,7 +395,9 @@ systemctl daemon-reload && systemctl restart vertex-proxy
 | `502 metadata ...` | 服务跑在 Cloud Run 等没有 ADC 文件的环境 | 配置 `ADC_PATH` |
 | 客户端报 cleartext 错误 | Android 禁止明文 HTTP | 前置一层 TLS 反代 |
 | 新窗口、没上下文，依然很慢 | 客户端走非流式，必须等全文生成 | 日志看 `stream=0`；改客户端开流式，或降低思考档位 |
-| 偶发 429 | 上游配额或瞬时拥塞 | 服务已自动退避重试，日志 `try>1` 即被救回 |
+| 偶发 429 | 共享容量瞬时争抢，不是配额被占满 | 自动退避重试；`note` 出现 `budget-exhausted` 表示放弃重试、快速失败 |
+| 429 报文里只有 message，没有 `quotaMetric`/`violations` | 属于 Dynamic Shared Quota 争抢，不是项目配额墙 | 提配额工单无效；换个模型或过几分钟再试 |
+| 单次请求等了 100 秒以上才报错 | 重试链叠加，每次 429 本身要几十秒才吐 | `RETRY_BUDGET_MS` 默认 25s 会中断重试链，可再调小 |
 | `504 upstream_timeout` | 上游迟迟不给响应头，通常是过载 | 等一会儿或换 `gemini-2.5-flash`；阈值可用 `TTFB_*_MS` 调 |
 | `ERROR ... This operation was aborted` | 客户端主动断开（超时或关窗） | 正常现象，上游请求已同时中止，不会空烧 token |
 | 选了图像模型却只回文字 | 客户端没带 `modalities`，上游就当文本模型用 | 检查 `IMAGE_AUTO_MODALITY` 是否被设成 `0` |

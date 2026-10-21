@@ -13,6 +13,9 @@ const ADC = process.env.ADC_PATH || (process.env.HOME || '/root') + '/.config/gc
 const RETRY_MAX = Number(process.env.RETRY_MAX || 3);        // 额外重试次数（总尝试 = RETRY_MAX + 1）
 const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 800);
 const RETRY_CAP_MS = Number(process.env.RETRY_CAP_MS || 8000); // 单次退避上限
+// 重试总预算：从请求开始算，超过这个时长就不再重试，直接把 429/503 还给客户端。
+// 依据：上游 429 往往要 40 秒才吐出来，4 次重试能把失败拖到 110 秒，用户以为卡死。
+const RETRY_BUDGET_MS = Number(process.env.RETRY_BUDGET_MS || 25000);
 const RETRY_ON = new Set([429, 503]);
 // 仅用于自测：把上游指向本地 mock（生产留空）
 const UPSTREAM_OVERRIDE = process.env.UPSTREAM_OVERRIDE || '';
@@ -298,6 +301,7 @@ const server = http.createServer(async function (req, res) {
     });
 
     let up = null;
+    let upText = null;   // 预算耗尽提前退出时，响应体已读走，留给下面复用
     const ttfbMs = streamMode === 1 ? TTFB_STREAM_MS : TTFB_NONSTREAM_MS;
     for (let i = 1; i <= RETRY_MAX + 1; i++) {
       attempts = i;
@@ -342,11 +346,15 @@ const server = http.createServer(async function (req, res) {
           throw e;
         }
         note = 'upstream-fetch:' + short(e && e.message, 160);
-        if (i <= RETRY_MAX) {
-          const d = backoffMs(i, 0);
-          log('RETRY', { model: model, attempt: i, reason: 'fetch-error', wait_ms: d, err: short(e && e.message, 120) });
-          await sleep(d);
+        const dErr = backoffMs(i, 0);
+        if (i <= RETRY_MAX && (Date.now() - t0 + dErr) <= RETRY_BUDGET_MS) {
+          log('RETRY', { model: model, attempt: i, reason: 'fetch-error', wait_ms: dErr, err: short(e && e.message, 120) });
+          await sleep(dErr);
           continue;
+        }
+        if (i <= RETRY_MAX) {
+          note = 'retry-budget-exhausted:fetch-error:' + (Date.now() - t0) + 'ms';
+          log('RETRY_SKIP', { model: model, attempt: i, reason: 'budget', elapsed_ms: Date.now() - t0 });
         }
         throw e;
       } finally {
@@ -359,6 +367,19 @@ const server = http.createServer(async function (req, res) {
         try { txt = await r.text(); } catch (e) { /* ignore */ }
         const ra = Number(r.headers.get('retry-after'));
         const d = backoffMs(i, isFinite(ra) ? ra : 0);
+        const elapsed = Date.now() - t0;
+        // 预算不够就不再重试：上游 429 常常要等几十秒才吐，硬重试会把失败拖成两分钟
+        if (elapsed + d > RETRY_BUDGET_MS) {
+          up = r;
+          upText = txt;
+          attempts = i;
+          note = 'up-' + r.status + ':budget-exhausted:' + elapsed + 'ms';
+          log('RETRY_SKIP', {
+            model: model, attempt: i, status: r.status,
+            elapsed_ms: elapsed, budget_ms: RETRY_BUDGET_MS, body: short(txt, 120)
+          });
+          break;
+        }
         note = 'up-' + r.status + ':' + short(txt, 160);
         log('RETRY', { model: model, attempt: i, status: r.status, wait_ms: d, retry_after: isFinite(ra) ? ra : '-', body: short(txt, 160) });
         await sleep(d);
@@ -371,9 +392,11 @@ const server = http.createServer(async function (req, res) {
 
     // 非 2xx：读完小响应体记日志，再原样回给客户端
     if (up.status >= 400) {
-      let txt = '';
-      try { txt = await up.text(); } catch (e) { /* ignore */ }
-      note = 'up-' + up.status + ':' + short(txt, 300);
+      let txt = upText != null ? upText : '';
+      if (upText == null) {
+        try { txt = await up.text(); } catch (e) { /* ignore */ }
+      }
+      if (note.indexOf('budget-exhausted') < 0) note = 'up-' + up.status + ':' + short(txt, 300);
       log('UPSTREAM_FAIL', { model: model, status: up.status, tries: attempts, body: short(txt, 300) });
       const ct = up.headers.get('content-type') || 'application/json';
       if (!res.headersSent) {
@@ -511,6 +534,7 @@ if (!PROJECT) {
 }
 
 server.listen(PORT, '0.0.0.0', function () {
-  console.log('[BOOT] %s vertex-proxy listening on %s -> project %s @ %s | retry_max=%s base_ms=%s cap_ms=%s',
-    new Date().toISOString(), PORT, PROJECT, LOC, RETRY_MAX, RETRY_BASE_MS, RETRY_CAP_MS);
+  console.log('[BOOT] %s vertex-proxy listening on %s -> project %s @ %s | retry_max=%s base_ms=%s cap_ms=%s budget_ms=%s ttfb_stream=%s ttfb_nonstream=%s',
+    new Date().toISOString(), PORT, PROJECT, LOC, RETRY_MAX, RETRY_BASE_MS, RETRY_CAP_MS,
+    RETRY_BUDGET_MS, TTFB_STREAM_MS, TTFB_NONSTREAM_MS);
 });
