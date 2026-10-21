@@ -233,6 +233,20 @@ GET https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=
 | 改写 content | 替换成一行 markdown 图片链接，删掉 `audio` 和 `refusal` |
 | 提供访问 | 暴露 `GET /images/<name>`，**不鉴权**（`<img>` 标签带不了 header） |
 
+流式和非流式都做了适配，但走的是不同路径：
+
+| 客户端 | 上游返回 | 代理处理 |
+|---|---|---|
+| `stream: false` | 一个完整 JSON | 解析后改写 `message.content` |
+| `stream: true` | SSE，图片 base64 分块在 `delta.audio.data` | 读完整个流，拼接 base64，重发一条干净的 SSE |
+
+流式必须先缓冲完整个上游流才能取出图片，所以**流式的「首字节」要等出图结束**，不是真流式。实测体积对比：
+
+| | 上游原始 | 代理改写后 |
+|---|---|---|
+| 非流式 | 2.3 MB | 2.2 KB |
+| 流式 | 1.2 MB | 710 B |
+
 改写后客户端收到的是：
 
 ```json
@@ -246,8 +260,7 @@ GET https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=
 
 ### 使用约束
 
-- **必须用非流式**（`stream: false`）。改写要读完整个响应体，流式逐块透传改不了。流式请求图像模型会拿到未适配的原始结构。
-- 单张图 1.5–2.5MB，`gemini-3-pro-image` 出图约 20 秒，flash 系列 6–10 秒。
+- 单张图 1.5–2.5MB，`gemini-3-pro-image` 出图约 20 秒，flash 系列 6–10 秒。客户端超时阈值要留够。
 - 图片目录默认保留 200 张，超出自动删最旧。想清空直接 `rm -rf images/*`。
 - 想让外部域名/端口访问图片，设 `PUBLIC_BASE_URL=https://your.domain`；留空则用请求的 `Host` 头拼。
 
@@ -404,7 +417,7 @@ systemctl daemon-reload && systemctl restart vertex-proxy
 
 - 只实现 `/v1/chat/completions`，不支持 OpenAI 的 `/v1/responses`
 - 不支持流式以外的特殊参数，如 `logprobs`、多模态文件上传
-- 图像模型只支持非流式改写；流式请求会拿到未适配的原始结构
+- 图像模型流式请求要先缓冲完整个上游流才能取出图片，表现为「攒够才吐」，不是真流式
 - `/images/` 不鉴权，靠文件名随机性保护。图片内容本身不敏感时可用；如需严格管控，应在反代层加签名或 IP 白名单
 - 不代理第三方模型（Claude、Llama 等）：它们走不同协议，且不参与 GCP 免费试用赠金抵扣
 - 单进程无并发限流，高频调用需要自行在反代层加限制

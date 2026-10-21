@@ -418,6 +418,70 @@ const server = http.createServer(async function (req, res) {
       }
     }
 
+    // 图像模型 + 流式：客户端要的是 SSE，但上游把图片 base64 分块塞进 delta.audio.data，
+    // 客户端不认识这个字段，只会显示成乱码或空白。
+    // 这里读完整个上游流，取出图片落盘，再用一条干净的 SSE 把 markdown 链接发回去。
+    if (IMG_SAVE && streamMode === 1 && /image/i.test(model) && up.body) {
+      let sb = null;
+      try { sb = Buffer.from(await up.arrayBuffer()); } catch (e) { sb = null; }
+      if (sb) {
+        const text = sb.toString('utf8');
+        let content = '';
+        let b64 = '';
+        let finish = 'stop';
+        let id = '';
+        let created = Math.floor(Date.now() / 1000);
+        const lines = text.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          const ln = lines[i];
+          if (ln.indexOf('data:') !== 0) continue;
+          const js = ln.slice(5).trim();
+          if (!js || js === '[DONE]') continue;
+          let o = null;
+          try { o = JSON.parse(js); } catch (e) { continue; }
+          if (o.id) id = o.id;
+          if (o.created) created = o.created;
+          const ch = o.choices && o.choices[0];
+          if (!ch) continue;
+          if (ch.finish_reason) finish = ch.finish_reason;
+          const d = ch.delta || {};
+          if (typeof d.content === 'string') content += d.content;
+          if (d.audio && typeof d.audio.data === 'string') b64 += d.audio.data;
+        }
+        const ext = b64 ? sniffImageExt(b64) : '';
+        if (ext) {
+          const rel = saveImage(b64, ext);
+          const base = PUBLIC_BASE || ('http://' + (req.headers.host || ('127.0.0.1:' + PORT)));
+          const url = rel ? base + rel : '';
+          const txt = content.trim();
+          content = (txt ? txt + '\n\n' : '') +
+            (url ? '![' + ext + '](' + url + ')' : '(图片已生成但落盘失败)');
+          imgB = Buffer.from(b64, 'base64').length;
+          imgUrl = url;
+        }
+        const mk = function (delta, fr) {
+          return 'data: ' + JSON.stringify({
+            id: id || ('chatcmpl-' + Date.now()),
+            object: 'chat.completion.chunk',
+            created: created,
+            model: model,
+            choices: [{ index: 0, delta: delta, finish_reason: fr === undefined ? null : fr }]
+          }) + '\n\n';
+        };
+        const out = Buffer.from(
+          mk({ role: 'assistant', content: '' }) +
+          mk({ content: content }) +
+          mk({}, finish) +
+          'data: [DONE]\n\n', 'utf8');
+        res.writeHead(up.status, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          'content-length': out.length
+        });
+        return res.end(out);
+      }
+    }
+
     res.writeHead(up.status, { 'content-type': ct });
 
     if (up.body) {
