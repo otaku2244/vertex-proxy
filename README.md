@@ -114,6 +114,11 @@ python3 scripts/deploy.py
 | `TTFB_STREAM_MS` | 否 | `45000` | 流式请求的首字节超时（首字节 = 首个 token） |
 | `TTFB_NONSTREAM_MS` | 否 | `120000` | 非流式请求的首字节超时（首字节 = 全文生成完，必须给足） |
 | `UPSTREAM_OVERRIDE` | 否 | 空 | 仅自测用，把上游指向本地 mock，生产留空 |
+| `IMAGE_SAVE` | 否 | `1` | 图像响应适配开关，设 `0` 则原样透传上游的畸形结构 |
+| `IMAGE_DIR` | 否 | `/root/vertex-proxy/images` | 生成的图片落盘目录 |
+| `IMAGE_KEEP` | 否 | `200` | 目录最多保留多少张，超出按时间删最旧 |
+| `IMAGE_AUTO_MODALITY` | 否 | `1` | 自动给图像模型补 `modalities:["text","image"]`，设 `0` 关闭 |
+| `PUBLIC_BASE_URL` | 否 | 空 | 图片链接的基地址；留空则用请求的 `Host` 头 |
 
 ---
 
@@ -124,6 +129,7 @@ python3 scripts/deploy.py
 | GET | `/health` | 存活检查，返回 `ok` |
 | GET | `/v1/models` | 返回支持的模型列表（OpenAI 格式） |
 | POST | `/v1/chat/completions` | 对话补全，支持流式 |
+| GET | `/images/<name>` | 图像模型生成的图片，**不鉴权** |
 
 调用示例：
 
@@ -154,6 +160,12 @@ curl -s http://127.0.0.1:18230/v1/chat/completions \
 | `google/gemini-2.5-pro` | pro | 4.72s | GA 正式版，长期可用 |
 | `google/gemini-2.5-flash` | flash | 3.79s | GA 正式版 |
 | `google/gemini-2.5-flash-lite` | lite | 3.80s | GA 正式版 |
+| `google/gemini-3-pro-image` | image | 5.9s / 出图 19.7s | 出图质量最高，1408×768 PNG |
+| `google/gemini-3.1-flash-image` | image | 1.4s / 出图 9.5s | 出图主力，1408×768 PNG |
+| `google/gemini-3.1-flash-image-preview` | image | — | 与上者同名不同期，行为一致 |
+| `google/gemini-3.1-flash-lite-image` | image | 0.8s / 出图 6.3s | 最小最快，输出 JPEG |
+
+「首字节 / 出图」两段是分开测的：不带 `modalities` 时它就是个普通文本模型（首字节极快）；带上才真正出图，那一段耗时才包含渲染。
 
 **3.x flash 比 2.5-flash 快 1.6–2.8 倍**，同 prompt 下输出还更详细。日常建议直接用 3.6/3.5-flash，不必守着 2.5。
 
@@ -179,7 +191,65 @@ GET https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=
 2. 只有 **`v1beta1`** 有这个端点，`v1` 返回 404
 3. 返回字段叫 **`publisherModels`**，不是 `models`——用错字段会静默得到 0 条，看着像「没有模型」
 
-清单里还有 `-tts`、`-image`、`-transcribe`、`-embedding`、`live` 等变体，它们不能用于 Chat Completions，别手填进客户端。
+清单里还有 `-tts`、`-transcribe`、`-embedding`、`live` 等变体，它们**不能**用于 Chat Completions。`-image` 系列可以，但需要额外处理，见下一节。
+
+---
+
+## 图像模型
+
+四个 `-image` 模型都能通过 `/v1/chat/completions` 出图，但上游返回的结构是畸形的，直接透传给客户端等于不可用。代理做了三处适配。
+
+### 坑一：图片藏在 `message.audio.data`
+
+正常 OpenAI 图像响应应该有 `images` 或 `content` 里的图片块。Vertex 兼容层不是——它把 PNG/JPEG 的 base64 塞进 **`message.audio.data`**，而 `content` 是空字符串：
+
+```json
+{
+  "choices": [{
+    "message": {
+      "audio": { "data": "iVBORw0KGgoAAAANSUhEUg..." },
+      "content": "",
+      "refusal": "Unexpected tool call: Model tried to call an undeclared function: google:image_gen"
+    }
+  }]
+}
+```
+
+### 坑二：伴随一条假的 `refusal`
+
+`refusal` 里那句「模型调用了未声明函数 `google:image_gen` / `google:display`」是兼容层对内部工具调用的误报。图片其实**已经生成好了**，但如果原样透传，客户端会判定为失败并显示这条错误。
+
+### 坑三：不带 `modalities` 就根本不出图
+
+实测同一个 prompt：不写 `modalities` 时，图像模型只回一段文本（`"你好！"`），一个像素都不生成。而 Operit 这类客户端不会自己带这个参数。
+
+### 代理怎么处理的
+
+| 环节 | 处理 |
+|---|---|
+| 补 `modalities` | 模型名含 `image` 且请求未指定时，自动注入 `["text","image"]` |
+| 取出图片 | 从 `message.audio.data` 读 base64，按文件头判断 png/jpg/gif/webp |
+| 落盘 | 写到 `IMAGE_DIR`，文件名 `img-<毫秒时间戳>-<6位随机>.<ext>` |
+| 改写 content | 替换成一行 markdown 图片链接，删掉 `audio` 和 `refusal` |
+| 提供访问 | 暴露 `GET /images/<name>`，**不鉴权**（`<img>` 标签带不了 header） |
+
+改写后客户端收到的是：
+
+```json
+{ "choices": [{ "message": {
+  "content": "![png](http://<你的地址>/images/img-1792555895441-i5tfi8.png)",
+  "role": "assistant"
+} }] }
+```
+
+响应体从 **2.3MB 降到 2.2KB**。这一步不是优化，是必需：2.3MB 的 base64 一旦进入对话历史，下一轮请求会连同它一起回传，上下文直接爆掉。
+
+### 使用约束
+
+- **必须用非流式**（`stream: false`）。改写要读完整个响应体，流式逐块透传改不了。流式请求图像模型会拿到未适配的原始结构。
+- 单张图 1.5–2.5MB，`gemini-3-pro-image` 出图约 20 秒，flash 系列 6–10 秒。
+- 图片目录默认保留 200 张，超出自动删最旧。想清空直接 `rm -rf images/*`。
+- 想让外部域名/端口访问图片，设 `PUBLIC_BASE_URL=https://your.domain`；留空则用请求的 `Host` 头拼。
 
 ---
 
@@ -314,6 +384,10 @@ systemctl daemon-reload && systemctl restart vertex-proxy
 | 偶发 429 | 上游配额或瞬时拥塞 | 服务已自动退避重试，日志 `try>1` 即被救回 |
 | `504 upstream_timeout` | 上游迟迟不给响应头，通常是过载 | 等一会儿或换 `gemini-2.5-flash`；阈值可用 `TTFB_*_MS` 调 |
 | `ERROR ... This operation was aborted` | 客户端主动断开（超时或关窗） | 正常现象，上游请求已同时中止，不会空烧 token |
+| 选了图像模型却只回文字 | 客户端没带 `modalities`，上游就当文本模型用 | 检查 `IMAGE_AUTO_MODALITY` 是否被设成 `0` |
+| 图像模型回空白 + `Unexpected tool call` | 关掉了 `IMAGE_SAVE`，畸形结构被原样透传 | 去掉 `IMAGE_SAVE=0` 重启 |
+| 图片链接打不开 | `PUBLIC_BASE_URL` 或 `Host` 头不是客户端可达的地址 | 显式设 `PUBLIC_BASE_URL` |
+| 图像请求报 400 `modalities` | 传了非 image 模型却带 `modalities` | 只在 `-image` 模型上用 |
 
 ---
 
@@ -330,6 +404,8 @@ systemctl daemon-reload && systemctl restart vertex-proxy
 
 - 只实现 `/v1/chat/completions`，不支持 OpenAI 的 `/v1/responses`
 - 不支持流式以外的特殊参数，如 `logprobs`、多模态文件上传
+- 图像模型只支持非流式改写；流式请求会拿到未适配的原始结构
+- `/images/` 不鉴权，靠文件名随机性保护。图片内容本身不敏感时可用；如需严格管控，应在反代层加签名或 IP 白名单
 - 不代理第三方模型（Claude、Llama 等）：它们走不同协议，且不参与 GCP 免费试用赠金抵扣
 - 单进程无并发限流，高频调用需要自行在反代层加限制
 

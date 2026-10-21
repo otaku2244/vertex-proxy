@@ -1,9 +1,20 @@
-# credentials & runtime artifacts
+# secrets
+.env
+*.service
+*.pem
+*.key
 application_default_credentials.json
-*.bak
+
+# runtime
 *.log
-*.json
-!package.json
+node_modules/
+# 图像模型生成的图片落在这里，每张 1~2.5MB，不进仓库
+images/
+
+# python
+__pycache__/
+*.pyc
+.venv/
 
 # os
 .DS_Store

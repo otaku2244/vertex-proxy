@@ -24,6 +24,19 @@ const UPSTREAM_OVERRIDE = process.env.UPSTREAM_OVERRIDE || '';
 const TTFB_STREAM_MS = Number(process.env.TTFB_STREAM_MS || 45000);
 const TTFB_NONSTREAM_MS = Number(process.env.TTFB_NONSTREAM_MS || 120000);
 
+// --- 图像模型响应适配（2026-10-21 新增）---
+// Vertex 的 OpenAI 兼容层出图时，base64 塞在 message.audio.data，content 为空，
+// 还附一条假的 refusal:"Unexpected tool call ... google:image_gen"。
+// 一张图 base64 约 2.4MB，直接留在 content 里会进对话历史，下一轮请求直接撑爆上下文。
+// 所以落盘成文件，content 只留一行 markdown 链接。
+const IMG_SAVE = process.env.IMAGE_SAVE !== '0';        // 设为 0 则关闭适配，原样透传
+const IMG_DIR = process.env.IMAGE_DIR || '/root/vertex-proxy/images';
+const IMG_KEEP = Number(process.env.IMAGE_KEEP || 200); // 目录里最多保留多少张
+const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+// 客户端（Operit 等）不会自己带 modalities。实测表明：请求体不写 modalities 时，
+// 图像模型只回文本、根本不出图，等于选了也没用。所以由代理补上，可用环境变量关掉。
+const IMAGE_AUTO_MODALITY = process.env.IMAGE_AUTO_MODALITY !== '0';
+
 const MODELS = [
   'google/gemini-4-argon',
   'google/gemini-3.8-flash',
@@ -36,7 +49,11 @@ const MODELS = [
   'google/gemini-3-flash-preview',
   'google/gemini-2.5-pro',
   'google/gemini-2.5-flash',
-  'google/gemini-2.5-flash-lite'
+  'google/gemini-2.5-flash-lite',
+  'google/gemini-3-pro-image',
+  'google/gemini-3.1-flash-image',
+  'google/gemini-3.1-flash-image-preview',
+  'google/gemini-3.1-flash-lite-image'
 ];
 
 let cache = { v: '', exp: 0 };
@@ -64,6 +81,40 @@ function backoffMs(attempt, retryAfterSec) {
 
 function readADC() {
   return JSON.parse(fs.readFileSync(ADC, 'utf8'));
+}
+
+// 从 base64 头部判断图片格式，不引入任何依赖
+function sniffImageExt(b64) {
+  if (b64.startsWith('iVBORw0KGgo')) return 'png';
+  if (b64.startsWith('/9j/')) return 'jpg';
+  if (b64.startsWith('R0lGOD')) return 'gif';
+  if (b64.startsWith('UklGR')) return 'webp';
+  return '';
+}
+
+function trimImageDir() {
+  try {
+    const names = fs.readdirSync(IMG_DIR).filter(function (n) { return /^img-/.test(n); });
+    if (names.length <= IMG_KEEP) return;
+    names.sort();                        // 文件名前缀带毫秒时间戳，字典序等于时间序
+    const drop = names.slice(0, names.length - IMG_KEEP);
+    for (let i = 0; i < drop.length; i++) {
+      try { fs.unlinkSync(IMG_DIR + '/' + drop[i]); } catch (e) { /* ignore */ }
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// 把图片写进 IMG_DIR，返回可访问的相对路径；失败返回空串
+function saveImage(b64, ext) {
+  try {
+    fs.mkdirSync(IMG_DIR, { recursive: true });
+    const name = 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext;
+    fs.writeFileSync(IMG_DIR + '/' + name, Buffer.from(b64, 'base64'));
+    trimImageDir();
+    return '/images/' + name;
+  } catch (e) {
+    return '';
+  }
 }
 
 async function getToken() {
@@ -111,6 +162,8 @@ const server = http.createServer(async function (req, res) {
   let effort = '-';      // reasoning_effort 档位
   let maxTok = '-';      // 客户端声明的输出上限
   let outBytes = 0;      // 实际回给客户端的字节数（流式含 SSE 包装）
+  let imgB = 0;          // 图像响应：落盘图片的原始字节数（0 表示这次没出图）
+  let imgUrl = '';       // 图像响应：改写进 content 的访问地址
 
   // 统计出站字节：hook write/end，不干预流控
   const _write = res.write.bind(res);
@@ -144,6 +197,8 @@ const server = http.createServer(async function (req, res) {
       effort: effort,
       max_tok: maxTok,
       out_b: outBytes,
+      img_b: imgB || '-',
+      img_url: imgUrl || '-',
       try: attempts,
       note: note
     });
@@ -156,6 +211,31 @@ const server = http.createServer(async function (req, res) {
     if (u.pathname === '/health') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end('ok');
+    }
+
+    // 图片静态路由：必须放在鉴权之前。
+    // 客户端的 <img>/markdown 渲染不会带 Authorization 头，加鉴权等于图永远 401。
+    // 文件名是 13 位时间戳 + 6 位随机串，不可枚举、不可猜。
+    if (u.pathname.indexOf('/images/') === 0) {
+      const name = u.pathname.slice('/images/'.length);
+      if (!/^img-[A-Za-z0-9._-]+$/.test(name)) {
+        return send(res, 400, { error: { message: 'bad image name' } });
+      }
+      return fs.readFile(IMG_DIR + '/' + name, function (e, buf) {
+        if (e) return send(res, 404, { error: { message: 'image not found' } });
+        const ext = (name.split('.').pop() || '').toLowerCase();
+        const mime = ext === 'png' ? 'image/png'
+          : (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg'
+          : ext === 'gif' ? 'image/gif'
+          : ext === 'webp' ? 'image/webp'
+          : 'application/octet-stream';
+        res.writeHead(200, {
+          'content-type': mime,
+          'content-length': buf.length,
+          'cache-control': 'public, max-age=86400'
+        });
+        res.end(buf);
+      });
     }
 
     if (AUTH) {
@@ -191,6 +271,10 @@ const server = http.createServer(async function (req, res) {
     model = String(body.model || 'gemini-2.5-flash');
     if (!model.includes('/')) model = 'google/' + model;
     body.model = model;
+
+    if (IMAGE_AUTO_MODALITY && /image/i.test(model) && !body.modalities) {
+      body.modalities = ['text', 'image'];
+    }
 
     // 观测增强：把这次请求的形态记下来，才能给"慢"归因
     streamMode = body.stream ? 1 : 0;
@@ -300,6 +384,40 @@ const server = http.createServer(async function (req, res) {
     }
 
     const ct = up.headers.get('content-type') || 'application/json';
+
+    // 图像模型：只在非流式下改写。要落盘就必须读完整个响应体，流式改写会破坏 SSE。
+    if (IMG_SAVE && streamMode === 0 && /image/i.test(model) && up.body) {
+      let ab = null;
+      try { ab = Buffer.from(await up.arrayBuffer()); } catch (e) { ab = null; }
+      if (ab) {
+        let j = null;
+        try { j = JSON.parse(ab.toString('utf8')); } catch (e) { j = null; }
+        const m0 = j && j.choices && j.choices[0] && j.choices[0].message;
+        const b64 = m0 && m0.audio && typeof m0.audio.data === 'string' ? m0.audio.data : '';
+        const ext = b64 ? sniffImageExt(b64) : '';
+        if (m0 && ext) {
+          const rel = saveImage(b64, ext);
+          const base = PUBLIC_BASE || ('http://' + (req.headers.host || ('127.0.0.1:' + PORT)));
+          const url = rel ? base + rel : '';
+          const txt = typeof m0.content === 'string' ? m0.content.trim() : '';
+          m0.content = (txt ? txt + '\n\n' : '') +
+            (url ? '![' + ext + '](' + url + ')' : '(图片已生成但落盘失败)');
+          delete m0.audio;
+          // 这条 refusal 是兼容层把内部的 google:image_gen 工具调用当成"未声明函数"报的假警，
+          // 原样留着会让客户端判定为失败，而图片其实已经生成好了
+          delete m0.refusal;
+          imgB = Buffer.from(b64, 'base64').length;
+          imgUrl = url;
+          const out = Buffer.from(JSON.stringify(j), 'utf8');
+          res.writeHead(up.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': out.length });
+          return res.end(out);
+        }
+        // 只是文本回答（图像模型也能纯聊天）：原样回放
+        res.writeHead(up.status, { 'content-type': ct, 'content-length': ab.length });
+        return res.end(ab);
+      }
+    }
+
     res.writeHead(up.status, { 'content-type': ct });
 
     if (up.body) {
