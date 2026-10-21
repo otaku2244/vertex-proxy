@@ -17,6 +17,13 @@ const RETRY_ON = new Set([429, 503]);
 // 仅用于自测：把上游指向本地 mock（生产留空）
 const UPSTREAM_OVERRIDE = process.env.UPSTREAM_OVERRIDE || '';
 
+// --- 上游首字节超时（2026-10-21 新增）---
+// 流式的首字节 = 首个 token，历史 p50 6.7s / p90 31.6s，45s 足够宽松；
+// 非流式的首字节 = 全文生成完，必须给足时间（历史见过 82s）。
+// 上游挂死时不再无限等待：超时即返回 504，让客户端立刻失败而不是干等两分钟。
+const TTFB_STREAM_MS = Number(process.env.TTFB_STREAM_MS || 45000);
+const TTFB_NONSTREAM_MS = Number(process.env.TTFB_NONSTREAM_MS || 120000);
+
 const MODELS = [
   'google/gemini-4-argon',
   'google/gemini-2.5-pro',
@@ -193,15 +200,24 @@ const server = http.createServer(async function (req, res) {
 
     // 客户端断开就中止上游请求，避免白烧 token（重试期间尤其重要）
     const ac = new AbortController();
+    let abortReason = '';   // 'client' 客户端断开 / 'ttfb' 上游首字节超时
     res.on('close', function () {
-      if (!res.writableEnded) ac.abort();
+      if (!res.writableEnded) { abortReason = abortReason || 'client'; ac.abort(); }
     });
 
     let up = null;
+    const ttfbMs = streamMode === 1 ? TTFB_STREAM_MS : TTFB_NONSTREAM_MS;
     for (let i = 1; i <= RETRY_MAX + 1; i++) {
       attempts = i;
       const tUp = Date.now();
       let r = null;
+      let timedOut = false;
+      // 只在上游给响应头之前计时；一旦拿到响应头立即清掉，不干扰后续流式传输
+      const ttfbTimer = setTimeout(function () {
+        timedOut = true;
+        if (!abortReason) abortReason = 'ttfb';
+        ac.abort();
+      }, ttfbMs);
       try {
         r = await fetch(upstream, {
           method: 'POST',
@@ -212,6 +228,23 @@ const server = http.createServer(async function (req, res) {
         upMs = Date.now() - tUp;
       } catch (e) {
         upMs = Date.now() - tUp;
+        if (timedOut) {
+          // 上游接到了请求却迟迟不回，重试只会让用户再等一轮，直接明确失败
+          note = 'ttfb-timeout:' + Math.round(upMs / 1000) + 's';
+          log('TTFB_TIMEOUT', {
+            model: model, waited_ms: upMs, limit_ms: ttfbMs, stream: streamMode,
+            msgs: nMsgs, tools: nTools, chars: nChars
+          });
+          send(res, 504, {
+            error: {
+              message: 'upstream sent no response headers within ' + Math.round(ttfbMs / 1000) +
+                's (' + model + '), it is likely overloaded — retry later or switch model',
+              type: 'upstream_timeout',
+              code: 504
+            }
+          });
+          return;
+        }
         if (e && e.name === 'AbortError') {
           note = 'client-abort';
           throw e;
@@ -224,6 +257,9 @@ const server = http.createServer(async function (req, res) {
           continue;
         }
         throw e;
+      } finally {
+        // 拿到响应头（或本轮已失败）就停表，避免误伤后续流式传输和下一次重试
+        clearTimeout(ttfbTimer);
       }
 
       if (RETRY_ON.has(r.status) && i <= RETRY_MAX) {
