@@ -88,6 +88,31 @@ const server = http.createServer(async function (req, res) {
   let upMs = 0;
   let note = '';
 
+  // --- 2026-10-21 观测增强：区分"慢"是上游排队、长输出，还是非流式等全文 ---
+  let streamMode = -1;   // 1=流式 0=非流式 -1=请求体未解析
+  let nMsgs = 0;         // messages 条数：新窗口首轮通常 1~2
+  let nTools = 0;        // tools 数组长度
+  let nChars = 0;        // 请求体字符数（粗估输入规模）
+  let effort = '-';      // reasoning_effort 档位
+  let maxTok = '-';      // 客户端声明的输出上限
+  let outBytes = 0;      // 实际回给客户端的字节数（流式含 SSE 包装）
+
+  // 统计出站字节：hook write/end，不干预流控
+  const _write = res.write.bind(res);
+  const _end = res.end.bind(res);
+  function countBytes(chunk) {
+    if (!chunk || typeof chunk === 'function') return;
+    outBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : (chunk.length || 0);
+  }
+  res.write = function (chunk, enc, cb) {
+    countBytes(chunk);
+    return _write(chunk, enc, cb);
+  };
+  res.end = function (chunk, enc, cb) {
+    countBytes(chunk);
+    return _end(chunk, enc, cb);
+  };
+
   // 每个请求一行访问日志，落在 journal 里
   res.on('finish', function () {
     log('ACCESS', {
@@ -97,6 +122,13 @@ const server = http.createServer(async function (req, res) {
       status: res.statusCode,
       ms: Date.now() - t0,
       up_ms: upMs,
+      stream: streamMode,
+      msgs: nMsgs,
+      tools: nTools,
+      chars: nChars,
+      effort: effort,
+      max_tok: maxTok,
+      out_b: outBytes,
       try: attempts,
       note: note
     });
@@ -144,6 +176,14 @@ const server = http.createServer(async function (req, res) {
     model = String(body.model || 'gemini-2.5-flash');
     if (!model.includes('/')) model = 'google/' + model;
     body.model = model;
+
+    // 观测增强：把这次请求的形态记下来，才能给"慢"归因
+    streamMode = body.stream ? 1 : 0;
+    nMsgs = Array.isArray(body.messages) ? body.messages.length : 0;
+    nTools = Array.isArray(body.tools) ? body.tools.length : 0;
+    nChars = raw.length;
+    effort = body.reasoning_effort || (body.reasoning && body.reasoning.effort) || '-';
+    maxTok = body.max_completion_tokens || body.max_tokens || '-';
 
     const at = await getToken();
     const host = LOC === 'global' ? 'aiplatform.googleapis.com' : LOC + '-aiplatform.googleapis.com';

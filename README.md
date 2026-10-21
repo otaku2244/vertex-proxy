@@ -1,99 +1,279 @@
-# vertex-proxy
+# Vertex AI OpenAI 兼容代理
 
-Minimal **OpenAI-compatible proxy for Google Vertex AI**, single-file Node.js, zero dependencies.
+把 Google Vertex AI 上的 Gemini 模型，包装成标准 OpenAI 接口。让只支持 OpenAI 协议的客户端（Operit、Cherry Studio、NextChat、LobeChat、Dify 等）能够直接调用 GCP 额度。
 
-把 Vertex AI 的 `endpoints/openapi/chat/completions` 包装成标准 `/v1/chat/completions`，
-供任何 OpenAI 兼容客户端（Operit / Serein / Cherry Studio / LibreChat …）直接接入。
+零第三方依赖，只用一个 Node 文件，约 120 行。
 
-## 特性
+---
 
-| 能力 | 说明 |
-|---|---|
-| Bearer 鉴权 | 客户端必须带 `Authorization: Bearer $PROXY_TOKEN` |
-| ADC 自动续期 | 读取 `application_default_credentials.json`（`authorized_user`），用 refresh_token 换 access_token，缓存并提前 5 分钟刷新 |
-| SSE 透传 | 上游响应体原样 pipe，流式不中断 |
-| 429/503 退避重试 | truncated exponential backoff + jitter，最多 3 次；上游给 `Retry-After` 时优先服从 |
-| 访问日志 | 每请求一行，落 journal，不含 prompt 内容 |
-| 客户端断连中止 | 客户端断开即 abort 上游请求，避免白烧 token |
+## 为什么需要这个
 
-## 环境变量
+在 GCP 上直接给客户端配 Vertex AI，会连续撞上三堵墙：
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `PORT` | `18230` | 监听端口 |
-| `GCP_PROJECT` | 必填 | GCP 项目 ID |
-| `GCP_LOCATION` | `global` | `global` 走全球池（官方推荐）；也可填 `us-central1` 等单区域 |
-| `PROXY_TOKEN` | 空 | 为空则不鉴权（不建议） |
-| `ADC_PATH` | `$HOME/.config/gcloud/application_default_credentials.json` | ADC 路径 |
-| `RETRY_MAX` | `3` | 额外重试次数（总尝试 = RETRY_MAX + 1） |
-| `RETRY_BASE_MS` | `800` | 指数退避基数 |
-| `RETRY_CAP_MS` | `8000` | 单次退避上限 |
-| `UPSTREAM_OVERRIDE` | 空 | 仅用于自测：把上游指向本地 mock |
+1. **拿不到服务账号密钥。** 2024 年 5 月 3 日之后创建的 GCP 组织，默认强制执行组织策略 `iam.disableServiceAccountKeyCreation`，控制台里的「创建密钥」按钮是灰的，也没有任何自助关闭入口。
+2. **Vertex 不收 API Key。** 它的推理端点只接受 OAuth2 access token。凭据页里创建的普通 API Key 对它无效，`API 限制` 下拉里甚至不会出现 Vertex 相关选项。
+3. **access token 一小时就过期。** 客户端没法自己续期，手动粘贴的话，手机一锁屏、浏览器一切后台，Cloud Shell 会话重置，token 立刻失效。
+
+这个代理解决的就是第三点：把续期这件事挪到服务端。客户端只需要一个永不变的地址和一个自己定的密码。
+
+---
+
+## 架构
+
+```
+客户端 (OpenAI 协议 + Bearer <PROXY_TOKEN>)
+        │
+        ▼
+本服务 (Node, 监听 18230)
+    ├─ 校验 PROXY_TOKEN
+    ├─ 用 refresh_token 换 access token（55 分钟缓存一次）
+    └─ 转发到 Google 官方端点
+        │
+        ▼
+https://aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LOCATION}/endpoints/openapi/chat/completions
+```
+
+关键点：请求最终打到的是 **Google 官方域名**，走官方计费。本服务只做协议翻译和凭证注入，不改写请求内容。
+
+---
+
+## 前置条件
+
+- 一台能访问 Google 的 Linux 服务器（香港、新加坡、日本等区域延迟较低）
+- Node.js 18 及以上（推荐 22）
+- GCP 项目已启用 `aiplatform.googleapis.com`（控制台里可能显示为 **Agent Platform API**）
+- 该项目已绑定有效的 Cloud Billing 账号
+- 一次交互式 OAuth 授权（只需做一次，之后长期有效）
+
+---
 
 ## 部署
 
-1. 机器上先有 ADC（`gcloud auth application-default login`，或用你自己的方式生成 `authorized_user` 凭据落到 ADC_PATH）：
+### 1. 在服务器上安装 gcloud
 
 ```bash
-gcloud auth application-default login
+mkdir -p /opt && cd /opt
+curl -sSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz -o gc.tgz
+tar -xzf gc.tgz && rm gc.tgz
+/opt/google-cloud-sdk/bin/gcloud --version
 ```
 
-2. 把 `server.js` 放到 `/opt/vertex-proxy/`，按 `vertex-proxy.service.example` 改好项目 ID 与 token，装到 `/etc/systemd/system/vertex-proxy.service`。
-
-3. 启动：
+### 2. 生成 ADC 凭证
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now vertex-proxy
+/opt/google-cloud-sdk/bin/gcloud auth application-default login --no-launch-browser
 ```
 
-4. 验证：
+终端会打印一个 `accounts.google.com` 的授权链接。在任意浏览器打开、登录、授权，把页面给出的验证码粘回终端。
 
-```bash
-curl -s localhost:18230/health
-curl -s -H "Authorization: Bearer $PROXY_TOKEN" localhost:18230/v1/models
-curl -s -H "Authorization: Bearer $PROXY_TOKEN" -H 'content-type: application/json' \
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"say ok"}]}' \
-  localhost:18230/v1/chat/completions
+成功后凭证写入：
+
+```
+~/.config/gcloud/application_default_credentials.json
 ```
 
-## 日志
+文件类型是 `authorized_user`，内含 `client_id`、`client_secret`、`refresh_token`。**这个文件等同于长期密码，权限保持 600，不要外传。**
+
+### 3. 配置并部署
 
 ```bash
+export VPS_HOST=your.server.ip
+export VPS_PASS=your-root-password
+export GCP_PROJECT=your-gcp-project-id
+export PROXY_TOKEN=$(openssl rand -hex 16)
+export GCP_LOCATION=global
+
+python3 scripts/deploy.py
+```
+
+脚本会渲染 systemd 配置、上传代码、启动服务，最后做一次端到端调用验证。
+
+### 4. 客户端配置
+
+| 字段 | 值 |
+|---|---|
+| 供应商 | OpenAI 兼容（不是 Responses） |
+| Base URL | `http://<你的服务器>:18230/v1` |
+| API 密钥 | 上面生成的 `PROXY_TOKEN` |
+| 模型 | 点「拉取模型列表」，或手填下表中的 ID |
+
+---
+
+## 环境变量
+
+| 变量 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `GCP_PROJECT` | 是 | — | 拥有 Vertex 额度的项目 ID |
+| `PROXY_TOKEN` | 否 | 空 | 客户端需携带的 Bearer token，留空则不鉴权（不建议） |
+| `GCP_LOCATION` | 否 | `global` | 区域，`global` 支持新模型 |
+| `PORT` | 否 | `18230` | 监听端口 |
+| `ADC_PATH` | 否 | `~/.config/gcloud/application_default_credentials.json` | 凭证路径 |
+| `RETRY_MAX` | 否 | `3` | 429/503 的额外重试次数（总尝试 = 该值 + 1） |
+| `RETRY_BASE_MS` | 否 | `800` | 指数退避基数，第 n 次等待约 `base × 2^(n-1)` |
+| `RETRY_CAP_MS` | 否 | `8000` | 单次退避上限；上游返回 `Retry-After` 时优先服从它 |
+| `UPSTREAM_OVERRIDE` | 否 | 空 | 仅自测用，把上游指向本地 mock，生产留空 |
+
+---
+
+## API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 存活检查，返回 `ok` |
+| GET | `/v1/models` | 返回支持的模型列表（OpenAI 格式） |
+| POST | `/v1/chat/completions` | 对话补全，支持流式 |
+
+调用示例：
+
+```bash
+curl -s http://127.0.0.1:18230/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-4-argon","messages":[{"role":"user","content":"你好"}],"max_tokens":200}'
+```
+
+模型名可以带 `google/` 前缀，也可以不带，服务会自动补全。
+
+---
+
+## 模型与区域
+
+| 模型 ID | 可用区域 | 备注 |
+|---|---|---|
+| `google/gemini-4-argon` | **仅 `global`** | 2026-10 GA，前沿模型，单价较高 |
+| `google/gemini-2.5-pro` | `global` / `us-central1` | 上一代旗舰 |
+| `google/gemini-2.5-flash` | `global` / `us-central1` | 日常主力，性价比高 |
+| `google/gemini-2.5-flash-lite` | `global` | 最便宜，适合高频轻任务 |
+
+**区域是最大的坑：** `gemini-4-argon` 只在 `global` 可用，请求打到 `us-central1` 会返回 404，报错内容是「Publisher model ... was not found or your project does not have access to it」，看起来像没权限，实际是区域不对。
+
+另外 `global` 的域名规则和区域性端点不同：`global` 走 `aiplatform.googleapis.com`，**不带** `global-` 前缀。代码里已做分支处理。
+
+---
+
+## 运维
+
+服务由 systemd 托管，配置了 `Restart=always` 和开机自启。
+
+```bash
+systemctl status vertex-proxy
+systemctl restart vertex-proxy
+journalctl -u vertex-proxy -n 50
 journalctl -u vertex-proxy -f
-journalctl -u vertex-proxy --since -1h | grep -E 'RETRY|UPSTREAM_FAIL|ACCESS'
 ```
 
-单行格式：
+日志走 journald，自动轮转，不会无限增长。
 
+### 更换 PROXY_TOKEN
+
+```bash
+NEWKEY=$(openssl rand -hex 16)
+sed -i "s/^Environment=PROXY_TOKEN=.*/Environment=PROXY_TOKEN=$NEWKEY/" /etc/systemd/system/vertex-proxy.service
+systemctl daemon-reload && systemctl restart vertex-proxy
 ```
-[ACCESS] 2026-10-20T13:15:29Z m=POST p=/v1/chat/completions model=google/gemini-4-argon status=200 ms=2003 up_ms=1998 try=1 note=
-[RETRY]  2026-10-20T13:15:44Z model=google/mock attempt=1 status=429 wait_ms=1000 retry_after=1 body={...}
-```
 
-`try` = 本请求总共尝试次数，`up_ms` = 上游耗时，`note` = 失败原因摘要（4xx/5xx 时带响应体）。
+先改服务、再改客户端，中间没有过渡期，旧 token 会立即失效。
 
-## 关于 429
+---
 
-Vertex AI 的 Gemini **没有 RPM 配额**，限的是**组织级 TPM 阈值**（按滚动 30 天消费分层，Standard PayGo）：
+## 日志与延迟归因
 
-| 模型家族 | Tier1 $10–250 | Tier2 $250–2k | Tier3 $2k–50k | Tier4 >$50k |
-|---|---|---|---|---|
-| Flash / Flash-Lite | 2,000,000 | 4,000,000 | 10,000,000 | 50,000,000 |
-| Pro 与 Argon | 500,000 | 1,000,000 | 2,000,000 | 10,000,000 |
+每个请求打印一行 `[ACCESS]`，字段足够定位「慢在哪一段」：
 
-阈值不是硬上限，是**优先放行的额度**：池子有余量时超额请求照常服务，高峰期先削突发。
-所以 `Resource exhausted. Please try again later.` 通常是共享容量争抢或秒级尖峰，不是账号异常。
+| 字段 | 含义 |
+|---|---|
+| `ms` | 端到端总耗时（收到请求 → 响应写完） |
+| `up_ms` | 上游首字节时间（发出请求 → 收到响应头） |
+| `stream` | `1` 流式 / `0` 非流式 / `-1` 请求体未解析 |
+| `msgs` | `messages` 条数，新窗口首轮通常 1~2 |
+| `tools` | `tools` 数组长度 |
+| `chars` | 请求体字符数，粗估输入规模 |
+| `effort` | `reasoning_effort` 档位，未设为 `-` |
+| `max_tok` | 客户端声明的输出上限 |
+| `out_b` | 实际回给客户端的字节数（流式含 SSE 包装） |
+| `try` | 第几次尝试，`>1` 说明发生过退避重试 |
+| `note` | 失败原因或上游错误摘要 |
 
-官方建议：用 `global` 端点、指数退避重试、平滑流量（别在同一秒并发多个大请求）、必要时提 QIR 或买 Provisioned Throughput。
+### 读法：先看 `stream`，再看 `up_ms`
 
-参考：<https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429>
+这是最容易误判的地方。**非流式请求的 `up_ms` 等于完整生成时间**，不是网络延迟——因为服务端要等整段生成完才吐第一个字节。
+
+实测同一个短 prompt（输出一个字）：
+
+| 模式 | `ms` | `up_ms` | 结论 |
+|---|---|---|---|
+| `stream=false` | 29.76s | 29.58s | 首字节 = 全文生成完 |
+| `stream=true` | 3.03s | 2.95s | 首字节 = 首个 token |
+
+同一个请求，非流式比流式慢约 10 倍，而网络和服务器完全没变。
+
+所以判断规则：
+
+- `up_ms` 大且 `ms - up_ms` 只有几十毫秒 → **非流式**，客户端在等全文，不是网络慢
+- `up_ms` 小（3~5s）但 `ms - up_ms` 有二三十秒 → **真流式**，模型在慢慢吐字
+- `up_ms` 大且 `ms - up_ms` 也大 → 上游排队 + 长输出，只能减上下文或换模型
+- `ms - up_ms` 稳定在 30~90ms → 响应头到达时全文已生成，典型非流式特征
+
+### 已观测到的量级（2026-10，81 次真实请求）
+
+| 指标 | p50 | p90 | max |
+|---|---|---|---|
+| 端到端 `ms` | 10.1s | 45.2s | 117.7s |
+| 上游首字节 `up_ms` | 5.1s | 28.3s | 111.9s |
+| 流式下发 `ms - up_ms` | 1.7s | 19.1s | 50.5s |
+
+`up_ms` 占端到端的比例：p50 **87.7%**。也就是说瓶颈几乎完全在 Google 侧，不在这台服务器。
+
+另外 `gemini-4-argon` 抖动极大，同一句问题的首字节在 2.2s / 3.0s / 3.9s / 9.8s 之间飘，说明上游存在排队，不是稳定延迟。
+
+### 已排除的变量
+
+用固定 prompt 做的对照实验，结论和直觉相反：
+
+| 变量 | 变化 | 端到端影响 |
+|---|---|---|
+| 工具数量 | 0 → 30 个（12 → 1542 token） | 无变化 |
+| 上下文长度 | 108 → 53,419 token | 4.4s → 6.2s（+40%） |
+| 思考档位 | `minimal/low/medium` | 都在 3s 内 |
+| 思考档位 | `high` | 14.3s，唯一明显变慢的档 |
+
+输入 token 的处理速度约 3 万/秒，所以「上下文太长拖慢首字」在 5 万 token 以内并不成立；真正的变量是**输出长度**和**思考档位**。
+
+---
+
+## 排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `404 Publisher model ... not found` | 模型在该区域不存在 | 把 `GCP_LOCATION` 改成 `global`，或换模型 |
+| `401 invalid api key` | 客户端填的 token 与服务端不一致 | 核对 `PROXY_TOKEN` |
+| `502 oauth 400 invalid_grant` | refresh token 被撤销 | 重做第 2 步授权 |
+| `502 metadata ...` | 服务跑在 Cloud Run 等没有 ADC 文件的环境 | 配置 `ADC_PATH` |
+| 客户端报 cleartext 错误 | Android 禁止明文 HTTP | 前置一层 TLS 反代 |
+| 新窗口、没上下文，依然很慢 | 客户端走非流式，必须等全文生成 | 日志看 `stream=0`；改客户端开流式，或降低思考档位 |
+| 偶发 429 | 上游配额或瞬时拥塞 | 服务已自动退避重试，日志 `try>1` 即被救回 |
+| `ERROR ... This operation was aborted` | 客户端主动断开（超时或关窗） | 正常现象，上游请求已同时中止，不会空烧 token |
+
+---
 
 ## 安全
 
-- 不要把 `application_default_credentials.json`、真实 `PROXY_TOKEN` 提交进仓库或打进镜像。
-- 这是单用户代理，没有多租户隔离、没有速率限制、没有 prompt 审计，**不要直接暴露到公网**。需要的话前面挂 nginx 加 TLS + IP 白名单。
+- **`PROXY_TOKEN` 和 ADC 文件都是敏感信息。** 一旦泄露，别人可以用你的 GCP 额度。
+- **不要把这个服务分享给他人使用。** 自用是正常的后端调用；多人共用一个凭证属于凭证共享，违反 Google 服务条款，可能触发风控并冻结项目资金。
+- 仓库里不要提交 `.env`、实际渲染出的 `.service` 文件、ADC 凭证。
+- 建议使用 SSH 密钥替代密码登录，并关闭 root 密码登录。
 
-## License
+---
 
-MIT
+## 已知限制
+
+- 只实现 `/v1/chat/completions`，不支持 OpenAI 的 `/v1/responses`
+- 不支持流式以外的特殊参数，如 `logprobs`、多模态文件上传
+- 不代理第三方模型（Claude、Llama 等）：它们走不同协议，且不参与 GCP 免费试用赠金抵扣
+- 单进程无并发限流，高频调用需要自行在反代层加限制
+
+---
+
+## 许可
+
+个人使用。请自行评估所在地区与 Google 服务条款的合规性。
