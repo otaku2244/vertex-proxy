@@ -53,6 +53,7 @@ const SIG_ON = process.env.THOUGHT_SIG !== '0';
 const SIG_MODE = String(process.env.THOUGHT_SIG_MODE || 'cache').toLowerCase(); // cache | skip
 const SIG_SKIP = 'skip_thought_signature_validator';   // Google 文档给出的校验跳过值
 const SIG_TTL_MS = Number(process.env.THOUGHT_SIG_TTL_MS || 6 * 3600 * 1000);
+const SIG_SSE_MAX = Number(process.env.THOUGHT_SIG_SSE_MAX || 8 * 1024 * 1024); // 旁听缓冲上限
 const SIG_MAX = Number(process.env.THOUGHT_SIG_MAX || 4000);   // 每条签名占 2 个索引，实际约存一半
 const sigStore = new Map();   // key -> { sig, t }；key 为 "id:<tool_call id>" 或 "k:<内容指纹>"
 
@@ -118,6 +119,46 @@ function harvestSigs(text) {
         n++;
       }
     }
+  }
+  return n;
+}
+
+// 从流式 SSE 里抓签名。delta.tool_calls 按 index 分片下发，先合并再取。
+// 只读旁听：不改变发给客户端的任何字节。
+function harvestSse(text) {
+  const lines = String(text || '').split('\n');
+  const acc = [];
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (ln.indexOf('data:') !== 0) continue;
+    const payload = ln.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let j = null;
+    try { j = JSON.parse(payload); } catch (e) { continue; }
+    const chs = j && Array.isArray(j.choices) ? j.choices : [];
+    for (let c = 0; c < chs.length; c++) {
+      const d = chs[c] && (chs[c].delta || chs[c].message);
+      const tcs = d && Array.isArray(d.tool_calls) ? d.tool_calls : [];
+      for (let k = 0; k < tcs.length; k++) {
+        const t = tcs[k] || {};
+        const idx = typeof t.index === 'number' ? t.index : k;
+        const cur = acc[idx] || (acc[idx] = { id: '', name: '', args: '', sig: '' });
+        if (t.id) cur.id = t.id;
+        const fn = t.function || {};
+        if (fn.name && !cur.name) cur.name = fn.name;
+        if (typeof fn.arguments === 'string') cur.args += fn.arguments;
+        const g = t.extra_content && t.extra_content.google;
+        if (g && g.thought_signature) cur.sig = g.thought_signature;
+      }
+    }
+  }
+  let n = 0;
+  for (let i = 0; i < acc.length; i++) {
+    const a = acc[i];
+    if (!a || !a.sig) continue;
+    rememberSig('id:' + a.id, a.sig);
+    rememberSig(sigKey(a.name, a.args), a.sig);
+    n++;
   }
   return n;
 }
@@ -636,7 +677,7 @@ const server = http.createServer(async function (req, res) {
     // thought_signature 代管（非流式）：上游把签名放在 tool_calls[].extra_content 里，
     // 客户端解析后丢弃，下一轮就 400。这里读完整个响应体，先存档再原样回给客户端。
     // 非流式本来就等全文生成完，读全量不增加延迟。
-    // 流式路径不做提取（当前客户端工具调用走 stream=0）；若改用流式，请求侧会走占位值兜底。
+    // 流式路径在下面旁听提取（见 harvestSse），不阻断转发。
     if (SIG_ON && streamMode === 0 && up.body && !res.headersSent) {
       let ab = null;
       try { ab = Buffer.from(await up.arrayBuffer()); } catch (e) { ab = null; }
@@ -654,6 +695,23 @@ const server = http.createServer(async function (req, res) {
 
     if (up.body) {
       const rs = Readable.fromWeb(up.body);
+      // 流式同样要抓签名：上游把签名放在 delta.tool_calls[].extra_content 里。
+      // 这里只旁听（额外挂一个 data 监听），不改写、不缓冲后再发，客户端收到的字节与上游完全一致。
+      const bags = SIG_ON ? [] : null;
+      let bagBytes = 0;
+      if (bags) {
+        rs.on('data', function (ch) {
+          if (bagBytes > SIG_SSE_MAX) return;
+          bagBytes += ch.length;
+          bags.push(ch);
+        });
+        rs.on('end', function () {
+          if (!bagBytes) return;
+          if (bagBytes > SIG_SSE_MAX) { note = note || 'sig-sse-too-big'; return; }
+          const got = harvestSse(Buffer.concat(bags).toString('utf8'));
+          if (got && sigStat) sigStat.got += got;
+        });
+      }
       rs.on('error', function (e) {
         note = 'stream:' + short(e && e.message, 120);
         log('STREAM_ERR', { model: model, err: note });

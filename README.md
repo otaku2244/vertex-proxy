@@ -124,6 +124,7 @@ python3 scripts/deploy.py
 | `THOUGHT_SIG_MODE` | 否 | `cache` | `cache` 先用缓存签名、未命中再兜底；`skip` 一律用占位值 |
 | `THOUGHT_SIG_TTL_MS` | 否 | `21600000` | 缓存有效期（6 小时），按 tool_call id 存放 |
 | `THOUGHT_SIG_MAX` | 否 | `4000` | 索引条目上限，超出淘汰最旧的（每条签名占 id + 指纹两位） |
+| `THOUGHT_SIG_SSE_MAX` | 否 | `8388608` | 流式旁听缓冲上限（字节），超过则不提取签名，记 `note=sig-sse-too-big` |
 
 ---
 
@@ -296,7 +297,9 @@ choices[0].message.tool_calls[0].extra_content.google.thought_signature
 
 代理在读写路径上代管签名，客户端无需改造：
 
-1. **响应侧（非流式）**：读完整个响应体，把签名存两份索引——按 `tool_call.id`，以及按 `function.name + arguments` 的内容指纹。非流式本来就等全文生成完，读全量不增加延迟。
+1. **响应侧**：把签名存两份索引——按 `tool_call.id`，以及按 `function.name + arguments` 的内容指纹。
+   - 非流式：读完整个响应体再存档，不增加延迟（本来就要等全文生成完）。
+   - 流式：另挂一个 `data` 监听旁听，把 SSE 里按 `index` 分片的 `delta.tool_calls` 合并后存档，`end` 时一次性提取。**只读旁听，发给客户端的字节与上游完全一致**，不缓冲后重发。
 2. **请求侧**：转发前扫描 `messages[].tool_calls`，发现缺 `extra_content.google.thought_signature` 就补。先按 `id` 找，再按内容指纹找；都查不到则填官方占位值 `skip_thought_signature_validator`。
 3. **不覆盖已有值**：客户端若能自己带回签名，原样放行，代理不介入。
 
@@ -310,17 +313,20 @@ choices[0].message.tool_calls[0].extra_content.google.thought_signature
 
 | 场景 | 修复前 | 修复后 |
 |---|---|---|
-| 首轮调用工具 | 200，返回签名 | 200，`sig=f0h0k0s0g1`（存 1 条） |
+| 首轮调用工具（非流式） | 200，返回签名 | 200，`sig=f0h0k0s0g1`（存 1 条） |
 | 次轮回传，id 不变 | **400** | 200，`sig=f1h1k0s0g0`（id 命中） |
 | 次轮回传，id 被重建 | 400 | 200，`sig=f1h1k1s0g0`（指纹命中） |
 | 全新 id + 全新参数 | 400 | 200，`sig=f1h0k0s1g0`（走占位值） |
 | 两条 functionCall 混合 | 400 | 200，`sig=f2h1k1s1g0` |
+| 首轮调用工具（**流式**） | 200，但 `g0` 没存下 | 200，`sig=f0h0k0s0g1`（从 SSE 提取） |
+| 流式次轮，id 被重建 | 占位值兜底 `s1` | 200，`sig=f1h1k1s0g0`（指纹命中） |
 
-日志字段 `sig=f{补了几条}h{命中数}k{其中指纹命中}s{走占位}g{存档几条}`，`-` 表示本次无需介入。**只要 `k` 在涨，说明 id 重建已被指纹索引兜住。**
+日志字段 `sig=f{补了几条}h{命中数}k{其中指纹命中}s{走占位}g{存档几条}`，`-` 表示本次无需介入。**只要 `k` 在涨，说明 id 重建已被指纹索引兜住；`s` 恒涨才是真没兜住。**
 
 ### 边界
 
-- **流式响应不做签名提取**。当前客户端工具调用走非流式，够用；若改用流式，请求侧会走占位值兜底，不会 400，但思考连续性会弱一些。
+- 流式提取靠旁听缓冲，上限 `THOUGHT_SIG_SSE_MAX`（默认 8 MB）。超过上限则不提取、记 `note=sig-sse-too-big`，请求侧退回占位值——不影响请求成功。
+- 流式只在流正常收尾（`end`）时提取。客户端中途断开、或上游异常中断，这一轮签名抓不到，下一轮走占位值。
 - 缓存是进程内内存，重启后清空。清空不影响可用性，只会退回占位值。
 - 指纹按 `name + arguments` 匹配：参数逐字不同（如 `{"a":1}` 与 `{"a": 1}`）会被规范化后视为同一份；参数确实不同则必定不命中，走占位值。
 - 占位值能过校验，但官方说明这可能导致 "degraded model performance"——能跑，但不是最优。所以优先命中缓存。
