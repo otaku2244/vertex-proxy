@@ -40,6 +40,79 @@ const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 // 图像模型只回文本、根本不出图，等于选了也没用。所以由代理补上，可用环境变量关掉。
 const IMAGE_AUTO_MODALITY = process.env.IMAGE_AUTO_MODALITY !== '0';
 
+// --- thought_signature 代管（2026-10-23 新增）---
+// Gemini 3 起，functionCall part 必须携带 thoughtSignature，否则上游直接 400：
+//   Function call is missing a thought_signature in functionCall parts.
+// 上游确实会返回它，位置在 choices[].message.tool_calls[].extra_content.google.thought_signature。
+// 但客户端（Operit 等）解析 OpenAI 兼容响应时只保留 id/type/function，extra_content 被丢弃，
+// 下一轮回传历史就变成"无签名 functionCall"，于是第一轮能调工具、第二轮必挂。
+// 代理这里按 tool_call id 把签名存档，请求转发前补回；缓存未命中时用官方占位值兜底，
+// 保证不会因为代理重启或换设备而再次 400。
+const SIG_ON = process.env.THOUGHT_SIG !== '0';
+const SIG_MODE = String(process.env.THOUGHT_SIG_MODE || 'cache').toLowerCase(); // cache | skip
+const SIG_SKIP = 'skip_thought_signature_validator';   // Google 文档给出的校验跳过值
+const SIG_TTL_MS = Number(process.env.THOUGHT_SIG_TTL_MS || 6 * 3600 * 1000);
+const SIG_MAX = Number(process.env.THOUGHT_SIG_MAX || 2000);
+const sigStore = new Map();   // tool_call id -> { sig, t }
+
+function rememberSig(id, sig) {
+  if (!id || !sig) return;
+  if (sigStore.size >= SIG_MAX) {
+    const oldest = sigStore.keys().next();
+    if (!oldest.done) sigStore.delete(oldest.value);
+  }
+  sigStore.delete(id);          // 重新插入，维持近似 LRU 顺序
+  sigStore.set(id, { sig: sig, t: Date.now() });
+}
+
+function lookupSig(id) {
+  const e = sigStore.get(String(id || ''));
+  if (!e) return '';
+  if (Date.now() - e.t > SIG_TTL_MS) { sigStore.delete(String(id)); return ''; }
+  return e.sig;
+}
+
+// 从非流式响应体里抓签名。返回抓到几条。
+function harvestSigs(text) {
+  let j = null;
+  try { j = JSON.parse(text); } catch (e) { return 0; }
+  const chs = j && Array.isArray(j.choices) ? j.choices : [];
+  let n = 0;
+  for (let i = 0; i < chs.length; i++) {
+    const msg = chs[i] && chs[i].message;
+    const tcs = msg && Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    for (let k = 0; k < tcs.length; k++) {
+      const c = tcs[k] || {};
+      const g = c.extra_content && c.extra_content.google;
+      if (g && g.thought_signature) { rememberSig(c.id, g.thought_signature); n++; }
+    }
+  }
+  return n;
+}
+
+// 请求侧补签名：就地改 body.messages 里 assistant.tool_calls 缺的 extra_content。
+function injectSigs(body, stat) {
+  const msgs = body && Array.isArray(body.messages) ? body.messages : [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (!m || !Array.isArray(m.tool_calls)) continue;
+    for (let k = 0; k < m.tool_calls.length; k++) {
+      const c = m.tool_calls[k];
+      if (!c || typeof c !== 'object') continue;
+      const g0 = c.extra_content && c.extra_content.google;
+      if (g0 && g0.thought_signature) { stat.have++; continue; }
+      const hit = SIG_MODE === 'skip' ? '' : lookupSig(c.id);
+      const val = hit || SIG_SKIP;
+      const ec = Object.assign({}, c.extra_content || {});
+      ec.google = Object.assign({}, (c.extra_content && c.extra_content.google) || {},
+        { thought_signature: val });
+      c.extra_content = ec;
+      stat.fill++;
+      if (hit) stat.hit++; else stat.skip++;
+    }
+  }
+}
+
 const MODELS = [
   'google/gemini-4-argon',
   'google/gemini-3.8-flash',
@@ -167,6 +240,7 @@ const server = http.createServer(async function (req, res) {
   let outBytes = 0;      // 实际回给客户端的字节数（流式含 SSE 包装）
   let imgB = 0;          // 图像响应：落盘图片的原始字节数（0 表示这次没出图）
   let imgUrl = '';       // 图像响应：改写进 content 的访问地址
+  let sigStat = null;    // thought_signature 代管：{have, fill, hit, skip, got}
 
   // 统计出站字节：hook write/end，不干预流控
   const _write = res.write.bind(res);
@@ -203,6 +277,9 @@ const server = http.createServer(async function (req, res) {
       img_b: imgB || '-',
       img_url: imgUrl || '-',
       try: attempts,
+      sig: sigStat && (sigStat.fill || sigStat.got)
+        ? ('f' + sigStat.fill + 'h' + sigStat.hit + 's' + sigStat.skip + 'g' + sigStat.got)
+        : '-',
       note: note
     });
   });
@@ -286,6 +363,15 @@ const server = http.createServer(async function (req, res) {
     nChars = raw.length;
     effort = body.reasoning_effort || (body.reasoning && body.reasoning.effort) || '-';
     maxTok = body.max_completion_tokens || body.max_tokens || '-';
+
+    // thought_signature 代管：客户端回传历史时会丢掉 tool_calls[].extra_content，
+    // 上游要求 functionCall 必带签名，所以转发前就地补回（缓存命中优先，否则用占位值）
+    if (SIG_ON) {
+      sigStat = { have: 0, fill: 0, hit: 0, skip: 0, got: 0 };
+      try { injectSigs(body, sigStat); } catch (e) {
+        note = 'sig-err:' + short(e && e.message, 60);
+      }
+    }
 
     const at = await getToken();
     const host = LOC === 'global' ? 'aiplatform.googleapis.com' : LOC + '-aiplatform.googleapis.com';
@@ -503,6 +589,23 @@ const server = http.createServer(async function (req, res) {
         });
         return res.end(out);
       }
+    }
+
+    // thought_signature 代管（非流式）：上游把签名放在 tool_calls[].extra_content 里，
+    // 客户端解析后丢弃，下一轮就 400。这里读完整个响应体，先存档再原样回给客户端。
+    // 非流式本来就等全文生成完，读全量不增加延迟。
+    // 流式路径不做提取（当前客户端工具调用走 stream=0）；若改用流式，请求侧会走占位值兜底。
+    if (SIG_ON && streamMode === 0 && up.body && !res.headersSent) {
+      let ab = null;
+      try { ab = Buffer.from(await up.arrayBuffer()); } catch (e) { ab = null; }
+      if (!ab) {
+        note = note || 'sig-read-fail';
+        return send(res, 502, { error: { message: 'upstream body read failed', type: 'proxy_error' } });
+      }
+      const got = harvestSigs(ab.toString('utf8'));
+      if (sigStat) sigStat.got = got;
+      res.writeHead(up.status, { 'content-type': ct, 'content-length': ab.length });
+      return res.end(ab);
     }
 
     res.writeHead(up.status, { 'content-type': ct });

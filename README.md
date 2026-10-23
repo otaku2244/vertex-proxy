@@ -120,6 +120,10 @@ python3 scripts/deploy.py
 | `IMAGE_KEEP` | 否 | `200` | 目录最多保留多少张，超出按时间删最旧 |
 | `IMAGE_AUTO_MODALITY` | 否 | `1` | 自动给图像模型补 `modalities:["text","image"]`，设 `0` 关闭 |
 | `PUBLIC_BASE_URL` | 否 | 空 | 图片链接的基地址；留空则用请求的 `Host` 头 |
+| `THOUGHT_SIG` | 否 | `1` | thought_signature 代管开关，设 `0` 关闭（关闭后多轮工具调用会 400） |
+| `THOUGHT_SIG_MODE` | 否 | `cache` | `cache` 先用缓存签名、未命中再兜底；`skip` 一律用占位值 |
+| `THOUGHT_SIG_TTL_MS` | 否 | `21600000` | 缓存有效期（6 小时），按 tool_call id 存放 |
+| `THOUGHT_SIG_MAX` | 否 | `2000` | 缓存条目上限，超出淘汰最旧的 |
 
 ---
 
@@ -264,6 +268,54 @@ GET https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=
 - 单张图 1.5–2.5MB，`gemini-3-pro-image` 出图约 20 秒，flash 系列 6–10 秒。客户端超时阈值要留够。
 - 图片目录默认保留 200 张，超出自动删最旧。想清空直接 `rm -rf images/*`。
 - 想让外部域名/端口访问图片，设 `PUBLIC_BASE_URL=https://your.domain`；留空则用请求的 `Host` 头拼。
+
+---
+
+## 工具调用与 thought_signature
+
+Gemini 3 起，functionCall part 必须携带 `thoughtSignature`。缺了不会降级，是直接 400：
+
+```
+Function call is missing a thought_signature in functionCall parts.
+This is required for tools to work correctly...
+```
+
+### 签名从哪来、又怎么丢的
+
+上游确实会返回它，位置在 OpenAI 兼容响应的：
+
+```
+choices[0].message.tool_calls[0].extra_content.google.thought_signature
+```
+
+实测是 116 字符的 base64。但客户端（Operit 等）解析响应时通常只保留 `id / type / function` 三个字段，`extra_content` 被丢掉。下一轮把历史回传时，functionCall 变成无签名，上游直接拒绝。
+
+**典型症状：第一轮能调工具，第二轮就 400；客户端还会自动重试，日志里出现连续多条同参数的 400。**
+
+### 代理怎么处理
+
+代理在读写路径上代管签名，客户端无需改造：
+
+1. **响应侧（非流式）**：读完整个响应体，把每个 `tool_call.id → signature` 存进内存表（TTL 6 小时，上限 2000 条），再原样回给客户端。非流式本来就等全文生成完，读全量不增加延迟。
+2. **请求侧**：转发前扫描 `messages[].tool_calls`，发现缺 `extra_content.google.thought_signature` 就补。优先用缓存里的真签名；查不到则填官方占位值 `skip_thought_signature_validator`。
+3. **不覆盖已有值**：客户端若能自己带回签名，原样放行，代理不介入。
+
+### 实测结果
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 首轮调用工具 | 200，返回签名 | 200，`sig=f0h0s0g1`（存 1 条） |
+| 次轮回传，不带签名 | **400** | 200，`sig=f1h1s0g0`（命中缓存） |
+| 次轮回传，缓存未命中 | — | 200，`sig=f1h0s1g0`（走占位值） |
+| 两条 functionCall 混合 | — | 200，`sig=f2h1s1g0` |
+
+日志字段 `sig=f{补了几条}h{缓存命中}s{走占位}g{存档几条}`，`-` 表示本次无需介入。
+
+### 边界
+
+- **流式响应不做签名提取**。当前客户端工具调用走非流式，够用；若改用流式，请求侧会走占位值兜底，不会 400，但思考连续性会弱一些。
+- 缓存是进程内内存，重启后清空。清空不影响可用性，只会退回占位值。
+- 占位值能过校验，但官方说明这可能导致 "degraded model performance"——能跑，但不是最优。所以优先命中缓存。
 
 ---
 
@@ -414,6 +466,7 @@ status=200 up_ms=99600 ms=410300 try=2
 | 图像模型回空白 + `Unexpected tool call` | 关掉了 `IMAGE_SAVE`，畸形结构被原样透传 | 去掉 `IMAGE_SAVE=0` 重启 |
 | 图片链接打不开 | `PUBLIC_BASE_URL` 或 `Host` 头不是客户端可达的地址 | 显式设 `PUBLIC_BASE_URL` |
 | 图像请求报 400 `modalities` | 传了非 image 模型却带 `modalities` | 只在 `-image` 模型上用 |
+| 工具调用第二轮起 400 `missing a thought_signature` | 客户端丢了 `tool_calls[].extra_content`；或 `THOUGHT_SIG=0` 关掉了代管 | 确认 `THOUGHT_SIG` 未关闭，日志 `sig=` 有 `f` 值 |
 
 ---
 
@@ -434,6 +487,8 @@ status=200 up_ms=99600 ms=410300 try=2
 - `/images/` 不鉴权，靠文件名随机性保护。图片内容本身不敏感时可用；如需严格管控，应在反代层加签名或 IP 白名单
 - 不代理第三方模型（Claude、Llama 等）：它们走不同协议，且不参与 GCP 免费试用赠金抵扣
 - 单进程无并发限流，高频调用需要自行在反代层加限制
+- thought_signature 只在非流式响应里提取；流式工具调用虽然不会 400（走占位值），但拿不到真签名
+- 签名缓存是进程内内存，重启即清空；清空后首轮多轮工具调用会退回占位值
 
 ---
 
