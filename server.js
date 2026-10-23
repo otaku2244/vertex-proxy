@@ -1,6 +1,7 @@
 'use strict';
 const http = require('http');
 const fs = require('fs');
+const crypto = require('crypto');
 const { Readable } = require('stream');
 
 const PORT = Number(process.env.PORT || 18230);
@@ -52,23 +53,49 @@ const SIG_ON = process.env.THOUGHT_SIG !== '0';
 const SIG_MODE = String(process.env.THOUGHT_SIG_MODE || 'cache').toLowerCase(); // cache | skip
 const SIG_SKIP = 'skip_thought_signature_validator';   // Google 文档给出的校验跳过值
 const SIG_TTL_MS = Number(process.env.THOUGHT_SIG_TTL_MS || 6 * 3600 * 1000);
-const SIG_MAX = Number(process.env.THOUGHT_SIG_MAX || 2000);
-const sigStore = new Map();   // tool_call id -> { sig, t }
+const SIG_MAX = Number(process.env.THOUGHT_SIG_MAX || 4000);   // 每条签名占 2 个索引，实际约存一半
+const sigStore = new Map();   // key -> { sig, t }；key 为 "id:<tool_call id>" 或 "k:<内容指纹>"
 
-function rememberSig(id, sig) {
-  if (!id || !sig) return;
+// 内容指纹：部分客户端（实测 Operit）每轮都会重新生成 tool_call id，
+// 只用 id 做 key 会让缓存永远打不中、全部退化成占位值。
+// 所以额外按 function name + arguments 存一份指纹索引，id 变了也能命中。
+function canon(v) {
+  if (v === undefined) return 'null';
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canon).join(',') + ']';
+  const ks = Object.keys(v).sort();
+  return '{' + ks.map(function (k) { return JSON.stringify(k) + ':' + canon(v[k]); }).join(',') + '}';
+}
+
+function argCanon(args) {
+  if (args == null) return '{}';
+  if (typeof args === 'object') return canon(args);
+  const s = String(args).trim();
+  try { return canon(JSON.parse(s)); } catch (e) { return s; }   // 不是合法 JSON 就按原文比对
+}
+
+function sigKey(name, args) {
+  return 'k:' + crypto.createHash('sha1')
+    .update(String(name || '') + '\u0000' + argCanon(args))
+    .digest('hex').slice(0, 16);
+}
+
+function rememberSig(key, sig) {
+  if (!key || !sig) return;
   if (sigStore.size >= SIG_MAX) {
     const oldest = sigStore.keys().next();
     if (!oldest.done) sigStore.delete(oldest.value);
   }
-  sigStore.delete(id);          // 重新插入，维持近似 LRU 顺序
-  sigStore.set(id, { sig: sig, t: Date.now() });
+  sigStore.delete(key);          // 重新插入，维持近似 LRU 顺序
+  sigStore.set(key, { sig: sig, t: Date.now() });
 }
 
-function lookupSig(id) {
-  const e = sigStore.get(String(id || ''));
+function lookupSig(key) {
+  const k = String(key || '');
+  if (!k) return '';
+  const e = sigStore.get(k);
   if (!e) return '';
-  if (Date.now() - e.t > SIG_TTL_MS) { sigStore.delete(String(id)); return ''; }
+  if (Date.now() - e.t > SIG_TTL_MS) { sigStore.delete(k); return ''; }
   return e.sig;
 }
 
@@ -84,7 +111,12 @@ function harvestSigs(text) {
     for (let k = 0; k < tcs.length; k++) {
       const c = tcs[k] || {};
       const g = c.extra_content && c.extra_content.google;
-      if (g && g.thought_signature) { rememberSig(c.id, g.thought_signature); n++; }
+      if (g && g.thought_signature) {
+        const fn = c.function || {};
+        rememberSig('id:' + c.id, g.thought_signature);              // 主索引
+        rememberSig(sigKey(fn.name, fn.arguments), g.thought_signature); // 指纹索引
+        n++;
+      }
     }
   }
   return n;
@@ -101,14 +133,23 @@ function injectSigs(body, stat) {
       if (!c || typeof c !== 'object') continue;
       const g0 = c.extra_content && c.extra_content.google;
       if (g0 && g0.thought_signature) { stat.have++; continue; }
-      const hit = SIG_MODE === 'skip' ? '' : lookupSig(c.id);
+      const fn = c.function || {};
+      let hit = '';
+      let byKey = 0;
+      if (SIG_MODE !== 'skip') {
+        hit = lookupSig('id:' + c.id);
+        if (!hit) {
+          hit = lookupSig(sigKey(fn.name, fn.arguments));
+          if (hit) byKey = 1;
+        }
+      }
       const val = hit || SIG_SKIP;
       const ec = Object.assign({}, c.extra_content || {});
       ec.google = Object.assign({}, (c.extra_content && c.extra_content.google) || {},
         { thought_signature: val });
       c.extra_content = ec;
       stat.fill++;
-      if (hit) stat.hit++; else stat.skip++;
+      if (hit) { stat.hit++; if (byKey) stat.khit++; } else { stat.skip++; }
     }
   }
 }
@@ -278,7 +319,8 @@ const server = http.createServer(async function (req, res) {
       img_url: imgUrl || '-',
       try: attempts,
       sig: sigStat && (sigStat.fill || sigStat.got)
-        ? ('f' + sigStat.fill + 'h' + sigStat.hit + 's' + sigStat.skip + 'g' + sigStat.got)
+        ? ('f' + sigStat.fill + 'h' + sigStat.hit + 'k' + sigStat.khit +
+           's' + sigStat.skip + 'g' + sigStat.got)
         : '-',
       note: note
     });
@@ -367,7 +409,7 @@ const server = http.createServer(async function (req, res) {
     // thought_signature 代管：客户端回传历史时会丢掉 tool_calls[].extra_content，
     // 上游要求 functionCall 必带签名，所以转发前就地补回（缓存命中优先，否则用占位值）
     if (SIG_ON) {
-      sigStat = { have: 0, fill: 0, hit: 0, skip: 0, got: 0 };
+      sigStat = { have: 0, fill: 0, hit: 0, khit: 0, skip: 0, got: 0 };
       try { injectSigs(body, sigStat); } catch (e) {
         note = 'sig-err:' + short(e && e.message, 60);
       }
